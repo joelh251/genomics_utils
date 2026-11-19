@@ -4,7 +4,6 @@ Translates protein fasta file headers to NCBI gene IDs
 
 import argparse
 import re
-import csv
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-i", "--input", help="Fasta file to translate headers of")
@@ -17,7 +16,7 @@ refSeqAccessionPattern = r'(NW_\d+(?:\.\d+)?)'
 genePattern = r'\[gene=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
 geneIDPattern = r'\[db_xref=GeneID:((?:[^\[\]]|\[[^\[\]]*\])*)\]'
 protPattern = r'\[protein=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
-protIDPattern = r'\[protein_id=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
+protIDPattern = r'\[protein_id=(XP_(?:[^\[\]]|\[[^\[\]]*\])*)\]'
 
 
 if args.cds:
@@ -28,9 +27,16 @@ if args.cds:
     
     cdsHeaders = []
     cdsDict = {}
+    duplicatesDict = {}
     for line in file:
         if line.startswith(">"):
             cdsHead = [None, None, None, None, None]
+
+            protIDMatch = re.search(protIDPattern, line)
+            if not protIDMatch:
+                next
+            cdsHead[4] = protIDMatch.group(1)
+            
             refSeqMatch = re.search(refSeqAccessionPattern, line)
             if refSeqMatch:
                 cdsHead[0] = refSeqMatch.group(1)
@@ -47,18 +53,23 @@ if args.cds:
             if protMatch:
                 cdsHead[3] = protMatch.group(1)
 
-            protIDMatch = re.search(protIDPattern, line)
-            if protIDMatch:
-                cdsHead[4] = protIDMatch.group(1)
-
             cdsHeaders.append(cdsHead)
-            cdsDict[cdsHead[4]] = cdsHead[0:3]
-            # Unavoidable issue here. There are duplicated protein accessions.
-            # Dicts don't allow duplicated keys, so these will get overwritten
-            # Not much I can really do about it
+
+            if cdsHead[4] in cdsDict:
+                if cdsHead[4] in duplicatesDict:
+                    duplicatesDict[cdsHead[4]].append(cdsHead[0:3])
+                else:
+                    duplicatesDict[cdsHead[4]] = [cdsHead[0:3]]
+            else:
+                cdsDict[cdsHead[4]] = cdsHead[0:3]
 
     file.close()
 
+for key in duplicatesDict:
+    print(str(key) + " : " + str(duplicatesDict[key]))
+    print(key)
+
+print(len(duplicatesDict))
 
 protAccessionPattern = r'(XP_\d+(?:\.\d+)?)'
 
@@ -72,23 +83,47 @@ if args.input and args.output:
     except:
         exit('Could not open "--output"')
 
+    duplicateMode = False
     pair = ["", ""]
     for line in inFile:
         if line.startswith(">"):
-            if "" not in pair:
+            if "" not in pair and not duplicateMode:
                 pair[1] += "\n"
                 outFile.write(pair[0])
                 outFile.write(pair[1])
+
+            if "" not in pair and duplicateMode:
+                for duplicate in duplicatesDict[pair[0]]:
+                    head = ">" + duplicate[2] + "\n"
+                    outFile.write(head)
+                    outFile.write(pair[1] + "\n")
+                    duplicateMode = False
+
             pair = ["", ""]
             protIDMatch = re.search(protAccessionPattern, line)
             if protIDMatch:
-                geneID = cdsDict[protIDMatch.group(1)][2]
-                pair[0] = ">" + geneID + "\n"
+                protRef = protIDMatch.group(1)
+                if protRef in duplicatesDict:
+                    pair[0] = protRef
+                    duplicateMode = True
+                else:
+                    geneID = cdsDict[protRef][2]
+                    pair[0] = ">" + geneID + "\n"
         else:
             pair[1] += line.strip()
-    if "" not in pair:
-                    pair[1] += "\n"
-                    outFile.write(pair[0])
-                    outFile.write(pair[1])
+
+    if "" not in pair and not duplicateMode:
+        pair[1] += "\n"
+        outFile.write(pair[0])
+        outFile.write(pair[1])
+
+    if "" not in pair and duplicateMode:
+        for duplicate in duplicatesDict[pair[0]]:
+            head = ">" + duplicate[2] + "\n"
+            outFile.write(head)
+            outFile.write(pair[1] + "\n")
+            duplicateMode = False
+
     inFile.close()
     outFile.close()
+

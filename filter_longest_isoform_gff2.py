@@ -38,9 +38,18 @@ def protein_id_from_cds(attributes):
     return None
 
 
+def ncbi_geneid_from_attributes(attributes):
+    """Extract the numeric NCBI GeneID from a Dbxref=GeneID:xxxx entry."""
+    for dbxref in attribute_values(attributes, "Dbxref"):
+        if dbxref.startswith("GeneID:"):
+            return dbxref.removeprefix("GeneID:")
+    return None
+
+
 def load_gff_mappings(gff_path):
     transcript_to_gene = {}
     gene_names = {}
+    gene_ncbi_ids = {}
     protein_to_transcripts = defaultdict(set)
     missing_protein_id = 0
     missing_parent = 0
@@ -62,6 +71,9 @@ def load_gff_mappings(gff_path):
                     gene_names[gene_id] = unquote(
                         attributes.get("locus_tag", attributes.get("Name", gene_id))
                     )
+                    ncbi_geneid = ncbi_geneid_from_attributes(attributes)
+                    if ncbi_geneid:
+                        gene_ncbi_ids[gene_id] = ncbi_geneid
 
             if feature in ("mRNA", "transcript") or attributes.get("gbkey") == "mRNA":
                 transcript_id = unquote(attributes.get("ID", ""))
@@ -91,11 +103,10 @@ def load_gff_mappings(gff_path):
             if protein_id and parents:
                 protein_to_transcripts[protein_id].update(parents)
 
-    protein_to_gene = {}
-    protein_to_transcripts_resolved = {}
+    protein_to_genes = defaultdict(set)
+    protein_to_gene_transcripts = defaultdict(lambda: defaultdict(set))
     unresolved_transcripts = set()
     for protein_id, transcript_ids in protein_to_transcripts.items():
-        gene_ids = set()
         for transcript_id in transcript_ids:
             gene_id = transcript_to_gene.get(transcript_id)
             if gene_id is None and transcript_id in gene_names:
@@ -103,23 +114,29 @@ def load_gff_mappings(gff_path):
             if gene_id is None:
                 unresolved_transcripts.add(transcript_id)
             else:
-                gene_ids.add(gene_id)
-        if len(gene_ids) > 1:
-            raise ValueError(
-                f"Protein {protein_id} maps to multiple genes: "
-                + ", ".join(sorted(gene_ids))
-            )
-        if gene_ids:
-            protein_to_gene[protein_id] = next(iter(gene_ids))
-            protein_to_transcripts_resolved[protein_id] = sorted(transcript_ids)
+                protein_to_genes[protein_id].add(gene_id)
+                protein_to_gene_transcripts[protein_id][gene_id].add(transcript_id)
 
+    multi_gene_proteins = {
+        protein_id: sorted(gene_ids)
+        for protein_id, gene_ids in protein_to_genes.items()
+        if len(gene_ids) > 1
+    }
     return (
-        protein_to_gene,
-        protein_to_transcripts_resolved,
+        dict(protein_to_genes),
+        {
+            protein_id: {
+                gene_id: sorted(transcript_ids)
+                for gene_id, transcript_ids in genes.items()
+            }
+            for protein_id, genes in protein_to_gene_transcripts.items()
+        },
         gene_names,
+        gene_ncbi_ids,
         missing_protein_id,
         missing_parent,
         unresolved_transcripts,
+        multi_gene_proteins,
     )
 
 
@@ -156,12 +173,13 @@ def iter_fasta_records(fasta_path):
 
 
 def write_mapping(mapping_path, protein_to_gene, protein_to_transcripts,
-                  gene_names, protein_lengths, selected_proteins):
+                  gene_names, gene_ncbi_ids, protein_lengths, selected_assignments):
     with mapping_path.open("w", newline="") as output:
         writer = csv.writer(output, delimiter="\t", lineterminator="\n")
         writer.writerow(
             (
                 "gene_id",
+                "ncbi_geneid",
                 "gene_name",
                 "transcript_ids",
                 "protein_id",
@@ -170,24 +188,27 @@ def write_mapping(mapping_path, protein_to_gene, protein_to_transcripts,
             )
         )
         for protein_id in sorted(protein_to_gene):
-            gene_id = protein_to_gene[protein_id]
-            writer.writerow(
-                (
-                    gene_id,
-                    gene_names.get(gene_id, gene_id),
-                    ",".join(protein_to_transcripts[protein_id]),
-                    protein_id,
-                    protein_lengths.get(protein_id, ""),
-                    int(protein_id in selected_proteins),
+            for gene_id in sorted(protein_to_gene[protein_id]):
+                writer.writerow(
+                    (
+                        gene_id,
+                        gene_ncbi_ids.get(gene_id, ""),
+                        gene_names.get(gene_id, gene_id),
+                        ",".join(protein_to_transcripts[protein_id][gene_id]),
+                        protein_id,
+                        protein_lengths.get(protein_id, ""),
+                        int((gene_id, protein_id) in selected_assignments),
+                    )
                 )
-            )
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Select the longest protein sequence per gene by following "
-            "GFF3 CDS -> transcript -> gene relationships."
+            "GFF3 CDS -> transcript -> gene relationships. Output FASTA "
+            "headers are the NCBI GeneID (falls back to the GFF gene ID "
+            "if no GeneID Dbxref is present)."
         ),
         epilog=(
             "Example: python3 filter_longest_isoform_gff.py genomic.gff "
@@ -222,24 +243,28 @@ def main():
             protein_to_gene,
             protein_to_transcripts,
             gene_names,
+            gene_ncbi_ids,
             missing_protein_id,
             missing_parent,
             unresolved_transcripts,
+            multi_gene_proteins,
         ) = load_gff_mappings(args.gff)
 
         if not protein_to_gene:
             raise ValueError("no CDS-to-gene mappings could be read from the GFF3")
 
         protein_lengths = {}
+        protein_sequences = {}
         best_by_gene = {}
         fasta_protein_count = 0
-        for protein_id, _, length, _ in iter_fasta_records(args.proteins):
+        for protein_id, header, length, sequence_lines in iter_fasta_records(args.proteins):
             fasta_protein_count += 1
             if protein_id in protein_lengths:
                 raise ValueError(f"duplicate protein FASTA identifier: {protein_id}")
             protein_lengths[protein_id] = length
-            gene_id = protein_to_gene.get(protein_id)
-            if gene_id is not None:
+            protein_sequences[protein_id] = sequence_lines
+            gene_ids = protein_to_gene.get(protein_id, set())
+            for gene_id in gene_ids:
                 previous = best_by_gene.get(gene_id)
                 if previous is None or length > previous[0]:
                     best_by_gene[gene_id] = (length, protein_id)
@@ -249,11 +274,26 @@ def main():
         if not best_by_gene:
             raise ValueError("no protein FASTA records matched the GFF3 protein IDs")
 
-        selected_proteins = {protein_id for _, protein_id in best_by_gene.values()}
+        selected_assignments = {
+            (gene_id, protein_id) for gene_id, (_, protein_id) in best_by_gene.items()
+        }
+        selected_proteins = {protein_id for _, protein_id in selected_assignments}
+
+        # Translate each selected protein's header to its NCBI GeneID
+        # (falls back to the GFF gene ID if no GeneID Dbxref is present).
+        missing_geneid_genes = set()
+        protein_to_header_geneid = {}
+        for gene_id, protein_id in selected_assignments:
+            ncbi_geneid = gene_ncbi_ids.get(gene_id)
+            if not ncbi_geneid:
+                missing_geneid_genes.add(gene_id)
+                ncbi_geneid = gene_id
+            protein_to_header_geneid[protein_id] = ncbi_geneid
+
         with args.output.open("w") as output:
             for protein_id, header, _, sequence_lines in iter_fasta_records(args.proteins):
                 if protein_id in selected_proteins:
-                    output.write(header + "\n")
+                    output.write(f">{protein_to_header_geneid[protein_id]}\n")
                     for sequence_line in sequence_lines:
                         output.write(sequence_line + "\n")
 
@@ -263,8 +303,9 @@ def main():
                 protein_to_gene,
                 protein_to_transcripts,
                 gene_names,
+                gene_ncbi_ids,
                 protein_lengths,
-                selected_proteins,
+                selected_assignments,
             )
     except (OSError, ValueError) as error:
         parser.error(str(error))
@@ -273,7 +314,7 @@ def main():
         protein_id in protein_lengths for protein_id in protein_to_gene
     )
     print(f"Protein FASTA records:        {fasta_protein_count:,}")
-    print(f"GFF protein-to-gene mappings: {len(protein_to_gene):,}")
+    print(f"GFF protein-to-gene mappings: {sum(map(len, protein_to_gene.values())):,}")
     print(f"Proteins matched:             {matched_proteins:,}")
     print(f"Genes retained:               {len(best_by_gene):,}")
     print(f"Proteins written:             {len(selected_proteins):,}")
@@ -294,6 +335,18 @@ def main():
         print(
             f"WARNING: {len(unresolved_transcripts):,} CDS Parent IDs had no "
             "transcript-to-gene mapping",
+            file=sys.stderr,
+        )
+    if missing_geneid_genes:
+        print(
+            f"WARNING: {len(missing_geneid_genes):,} genes had no NCBI GeneID "
+            "Dbxref; used the GFF gene ID as the FASTA header instead",
+            file=sys.stderr,
+        )
+    for protein_id, gene_ids in sorted(multi_gene_proteins.items()):
+        print(
+            f"WARNING: protein {protein_id} maps to multiple genes "
+            f"({', '.join(gene_ids)}); considering it for each gene",
             file=sys.stderr,
         )
     if matched_proteins < len(protein_to_gene):
