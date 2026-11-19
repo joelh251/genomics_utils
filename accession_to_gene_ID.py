@@ -9,13 +9,9 @@ import csv
 parser = argparse.ArgumentParser()
 parser.add_argument("-i", "--input", help="Fasta file to translate headers of")
 parser.add_argument("-c", "--cds", help="CDS file to build dictionary from")
-parser.add_argument("-d", "--dict", help="Pre-generated dictionary file")
 parser.add_argument("-o", "--output", help="Path to save translated fasta file")
-parser.add_argument("-s", "--save", help="Path to save generated dictionary")
 args = parser.parse_args()
 
-if args.dict and args.cds:
-    exit('Mutually exclusive arguments "--cds" and "--dict" supplied, only 1 may be supplied')
 
 refSeqAccessionPattern = r'(NW_\d+(?:\.\d+)?)'
 genePattern = r'\[gene=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
@@ -23,11 +19,6 @@ geneIDPattern = r'\[db_xref=GeneID:((?:[^\[\]]|\[[^\[\]]*\])*)\]'
 protPattern = r'\[protein=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
 protIDPattern = r'\[protein_id=((?:[^\[\]]|\[[^\[\]]*\])*)\]'
 
-if args.input and not args.output:
-    if args.input:
-        exit('No "--output" specified')
-    if args.output:
-        exit('No "--input" specified')
 
 if args.cds:
     try:
@@ -68,26 +59,6 @@ if args.cds:
 
     file.close()
 
-if args.save:
-    with open(args.save, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["refseq_accession", "gene", "NCBI_gene_id", "protein", "protein_accession"])
-        writer.writerows(cdsHeaders)
-
-if args.dict:
-    try:
-        file = open(args.dict, "r", newline="")
-    except:
-        exit("Dictionary file could not be opened")
-
-    reader = csv.reader(file)
-    next(reader)
-    rows = [row for row in reader]
-    cdsDict = {}
-    for row in rows:
-        cdsDict[row[4]] = row[0:3]
-
-    file.close()
 
 protAccessionPattern = r'(XP_\d+(?:\.\d+)?)'
 
