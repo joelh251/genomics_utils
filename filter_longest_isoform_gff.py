@@ -290,12 +290,18 @@ def main():
                 ncbi_geneid = gene_id
             protein_to_header_geneid[protein_id] = ncbi_geneid
 
+        written_geneids = set()
         with args.output.open("w") as output:
             for protein_id, header, _, sequence_lines in iter_fasta_records(args.proteins):
-                if protein_id in selected_proteins:
-                    output.write(f">{protein_to_header_geneid[protein_id]}\n")
-                    for sequence_line in sequence_lines:
-                        output.write(sequence_line + "\n")
+                if protein_id not in selected_proteins:
+                    continue
+                ncbi_geneid = protein_to_header_geneid[protein_id]
+                if ncbi_geneid in written_geneids:
+                    continue
+                written_geneids.add(ncbi_geneid)
+                output.write(f">{ncbi_geneid}\n")
+                for sequence_line in sequence_lines:
+                    output.write(sequence_line + "\n")
 
         if args.mapping:
             write_mapping(
